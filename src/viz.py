@@ -60,6 +60,92 @@ def plot_spending_over_time(transactions: pd.DataFrame) -> go.Figure:
     return fig
 
 
+def plot_daily_spend(transactions: pd.DataFrame, currency_symbol: str | None = None) -> go.Figure:
+    """Return a modern line chart showing daily spend for a given month."""
+
+    df = utils.ensure_dataframe(transactions).copy()
+    if df.empty:
+        return _empty_figure("No transactions for this month.")
+
+    df["posted_date"] = pd.to_datetime(df.get("posted_date", pd.Timestamp.today()))
+
+    spend = df.loc[df["amount"] < 0].copy()
+    if spend.empty:
+        return _empty_figure("No spend transactions this month.")
+
+    spend["date"] = spend["posted_date"].dt.normalize()
+    spend["value"] = -spend["amount"]
+
+    daily_totals = spend.groupby("date", as_index=False)["value"].sum()
+    date_range = pd.date_range(daily_totals["date"].min(), daily_totals["date"].max(), freq="D")
+    daily_totals = (
+        daily_totals.set_index("date").reindex(date_range, fill_value=0.0).rename_axis("date").reset_index()
+    )
+
+    hover_currency = f"{currency_symbol}" if currency_symbol else ""
+    hover_template = f"%{{x|%d %b}}<br>{hover_currency}%{{y:,.2f}}<extra></extra>"
+
+    fig = go.Figure()
+    fig.add_trace(
+        go.Scatter(
+            x=daily_totals["date"],
+            y=daily_totals["value"],
+            mode="lines+markers",
+            name="Daily spend",
+            line=dict(color="#2563eb", width=3, shape="spline", smoothing=0.45),
+            marker=dict(size=7, color="#2563eb", line=dict(color="#ffffff", width=1.5)),
+            fill="tozeroy",
+            fillcolor="rgba(37, 99, 235, 0.12)",
+            hovertemplate=hover_template,
+        )
+    )
+
+    top_points = daily_totals.nlargest(min(3, len(daily_totals)), "value")
+    if not top_points.empty:
+        fig.add_trace(
+            go.Scatter(
+                x=top_points["date"],
+                y=top_points["value"],
+                mode="markers",
+                name="Peak days",
+                marker=dict(size=10, color="#f97316", line=dict(color="#ffffff", width=2)),
+                hovertemplate=hover_template,
+                showlegend=False,
+            )
+        )
+
+    latest_point = daily_totals.iloc[[-1]] if not daily_totals.empty else pd.DataFrame()
+    if not latest_point.empty:
+        fig.add_trace(
+            go.Scatter(
+                x=latest_point["date"],
+                y=latest_point["value"],
+                mode="markers",
+                marker=dict(size=10, color="#1d4ed8", symbol="circle", line=dict(color="#ffffff", width=2)),
+                hovertemplate=hover_template,
+                name="Latest",
+                showlegend=False,
+            )
+        )
+
+    fig.update_layout(
+        title="",
+        xaxis_title="Date",
+        yaxis_title="Spend",
+        margin=dict(l=0, r=0, t=20, b=0),
+        hovermode="x unified",
+        xaxis=dict(showgrid=False, tickformat="%d %b"),
+        yaxis=dict(
+            showgrid=True,
+            gridcolor="rgba(148, 163, 184, 0.25)",
+            zeroline=False,
+        ),
+        plot_bgcolor="rgba(0,0,0,0)",
+        paper_bgcolor="rgba(0,0,0,0)",
+    )
+    return fig
+
+
 def plot_monthly_net_flow(monthly_balance: Iterable[Mapping[str, object]]) -> go.Figure:
     data = list(monthly_balance)
     if not data:
