@@ -66,24 +66,42 @@ def test_write_synthetic_csvs(tmp_path) -> None:
 def test_features_add_engineered_features_creates_columns() -> None:
     df = synth.generate_sample_transactions(rows=400, seed=2)
     enriched = features.add_engineered_features(df)
-    expected = {"month", "weekday", "is_recurring", "abs_amount", "monthly_net_amount", "category_month_share"}
+    expected = {
+        "month",
+        "weekday",
+        "is_recurring",
+        "abs_amount",
+        "monthly_net_amount",
+        "category_month_share",
+        "is_fixed_spend",
+        "spend_rhythm",
+        "spend_necessity",
+    }
     assert expected.issubset(enriched.columns)
     assert enriched["abs_amount"].ge(0).all()
     assert set(enriched["is_credit"].unique()).issubset({True, False})
+    assert set(enriched["spend_rhythm"].dropna().unique()).issubset({"Fixed", "Variable"})
+    assert set(enriched["spend_necessity"].dropna().unique()).issubset({"Essentials", "Discretionary"})
 
 
 def test_insights_calculate_kpis_returns_values() -> None:
     df = features.add_engineered_features(synth.generate_sample_transactions(rows=320, seed=3))
-    kpis = insights.calculate_kpis(df)
-    assert {
-        "Total spent",
-        "Total received",
-        "Avg. debit",
-        "Recurring share",
-        "Top spend category",
-        "Net cashflow",
-    }.issubset(kpis.keys())
-    assert all(isinstance(val, str) and val for val in kpis.values())
+    payload = insights.calculate_kpis(df)
+
+    summary = payload["summary"]
+    assert summary["total_spend"] > 0
+    assert summary["total_income"] > 0
+    assert "monthly_balance" in payload and isinstance(payload["monthly_balance"], list)
+    assert "top_categories" in payload and "current_month" in payload["top_categories"]
+    assert "spend_split" in payload and set(payload["spend_split"].keys()) == {
+        "fixed",
+        "variable",
+        "essentials",
+        "discretionary",
+    }
+    assert "cash_projection" in payload and "projected_end_balance" in payload["cash_projection"]
+    assert "payday" in payload and "next_payday" in payload["payday"]
+    assert "category_spend" in payload
 
 
 def test_viz_plot_spending_over_time_returns_fig() -> None:

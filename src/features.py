@@ -2,9 +2,39 @@
 
 from __future__ import annotations
 
+import numpy as np
 import pandas as pd
 
 from . import utils
+
+ESSENTIAL_CATEGORIES = {
+    "Housing",
+    "Utilities",
+    "Bills",
+    "Groceries",
+    "Transport",
+}
+
+ESSENTIAL_SUBCATEGORIES = {
+    ("Food & Drink", "Delivery"),
+    ("Food & Drink", "Supermarket"),
+    ("Wellness", "Gym"),
+}
+
+FIXED_CATEGORIES = {
+    "Housing",
+    "Utilities",
+    "Bills",
+    "Wellness",
+}
+
+
+def _is_essential(category: str, subcategory: str) -> bool:
+    if category in ESSENTIAL_CATEGORIES:
+        return True
+    if (category, subcategory) in ESSENTIAL_SUBCATEGORIES:
+        return True
+    return False
 
 
 def add_engineered_features(transactions: pd.DataFrame) -> pd.DataFrame:
@@ -23,6 +53,20 @@ def add_engineered_features(transactions: pd.DataFrame) -> pd.DataFrame:
     df["is_recurring"] = df["recurring_id"].notna()
     df["is_credit"] = df["amount"] > 0
     df["abs_amount"] = df["amount"].abs()
+
+    df["is_fixed_spend"] = df["is_recurring"] | df["category"].isin(FIXED_CATEGORIES)
+    df.loc[df["is_credit"], "is_fixed_spend"] = False
+
+    df["is_essential"] = df.apply(
+        lambda row: _is_essential(row["category"], row.get("subcategory", "")),
+        axis=1,
+    )
+    df.loc[df["is_credit"], "is_essential"] = False
+
+    df["spend_rhythm"] = np.where(df["is_fixed_spend"], "Fixed", "Variable")
+    df["spend_necessity"] = np.where(
+        df["is_essential"], "Essentials", "Discretionary"
+    )
 
     monthly_net = df.groupby(["user_id", "month"])["amount"].transform("sum")
     df["monthly_net_amount"] = monthly_net.round(2)
