@@ -102,6 +102,14 @@ def test_insights_calculate_kpis_returns_values() -> None:
     assert "cash_projection" in payload and "projected_end_balance" in payload["cash_projection"]
     assert "payday" in payload and "next_payday" in payload["payday"]
     assert "category_spend" in payload
+    assert "category_merchants" in payload and isinstance(payload["category_merchants"], dict)
+    assert "month_to_date_projection" in payload and isinstance(payload["month_to_date_projection"], list)
+    assert "outlier_points" in payload and isinstance(payload["outlier_points"], list)
+    assert "recurring" in payload and isinstance(payload["recurring"], list)
+    assert "anomalies" in payload and isinstance(payload["anomalies"], list)
+    if payload["category_spend"]:
+        sample_category = payload["category_spend"][0]["name"]
+        assert sample_category in payload["category_merchants"]
 
 
 def test_viz_plot_spending_over_time_returns_fig() -> None:
@@ -109,6 +117,21 @@ def test_viz_plot_spending_over_time_returns_fig() -> None:
     figure = viz.plot_spending_over_time(df)
     assert isinstance(figure, go.Figure)
     assert figure.data, "Chart should plot at least one trace"
+
+
+def test_viz_stage_three_charts_return_figs() -> None:
+    df = features.add_engineered_features(synth.generate_sample_transactions(rows=700, seed=6))
+    payload = insights.calculate_kpis(df)
+
+    assert isinstance(viz.plot_monthly_net_flow(payload["monthly_balance"]), go.Figure)
+    assert isinstance(viz.plot_month_to_date_projection(payload["month_to_date_projection"]), go.Figure)
+    assert isinstance(viz.plot_category_donut(payload["category_spend"]), go.Figure)
+    assert isinstance(viz.plot_outlier_scatter(payload["outlier_points"]), go.Figure)
+
+    if payload["category_spend"]:
+        category_name = payload["category_spend"][0]["name"]
+        merchants = payload["category_merchants"].get(category_name, [])
+        assert isinstance(viz.plot_merchant_bar(merchants, category_name), go.Figure)
 
 
 def test_summarize_spending_fallback() -> None:

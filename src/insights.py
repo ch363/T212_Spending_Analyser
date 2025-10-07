@@ -73,17 +73,36 @@ class AnomalyInsight(TypedDict):
     category: str
 
 
+class MonthToDatePoint(TypedDict):
+    date: str
+    actual: float | None
+    projected: float
+
+
+class OutlierPoint(TypedDict):
+    txn_id: str
+    posted_date: str
+    merchant: str
+    category: str
+    amount: float
+    z_score: float | None
+    is_flagged: bool
+
+
 class InsightsPayload(TypedDict):
     summary: SummaryMetrics
     monthly_balance: list[MonthlyBalance]
     top_categories: dict[str, list[BreakdownEntry]]
     top_merchants: dict[str, list[BreakdownEntry]]
+    category_merchants: dict[str, list[BreakdownEntry]]
     spend_split: SpendSplit
     cash_projection: CashProjection
     payday: PaydayStats
     recurring: list[RecurringInsight]
     anomalies: list[AnomalyInsight]
     category_spend: list[BreakdownEntry]
+    month_to_date_projection: list[MonthToDatePoint]
+    outlier_points: list[OutlierPoint]
 
 
 def _ensure_columns(df: pd.DataFrame) -> pd.DataFrame:
@@ -149,11 +168,15 @@ def _monthly_balance(df: pd.DataFrame) -> list[MonthlyBalance]:
     grouped = df.groupby("month")
     records = []
     for month, bucket in grouped:
+        if isinstance(month, pd.Period):
+            month_ts = month.to_timestamp()
+        else:
+            month_ts = pd.to_datetime(month)
         credits = bucket.loc[bucket["amount"] > 0, "amount"].sum()
         debits = -bucket.loc[bucket["amount"] < 0, "amount"].sum()
         records.append(
             {
-                "month": _format_month(month if isinstance(month, pd.Timestamp) else month.to_timestamp()),
+                "month": _format_month(month_ts),
                 "income": float(credits),
                 "spend": float(debits),
                 "net": float(credits - debits),
@@ -177,8 +200,18 @@ def _spend_split(df: pd.DataFrame) -> SpendSplit:
 
     spend["value"] = spend["amount"].abs()
 
-    fixed = spend.loc[spend.get("is_fixed_spend", False), "value"].sum()
-    essentials = spend.loc[spend.get("spend_necessity") == "Essentials", "value"].sum()
+    if "is_fixed_spend" in spend:
+        fixed_mask = spend["is_fixed_spend"].astype(bool)
+    else:
+        fixed_mask = pd.Series(False, index=spend.index)
+
+    if "spend_necessity" in spend:
+        necessity_series = spend["spend_necessity"].astype(str)
+    else:
+        necessity_series = pd.Series("Discretionary", index=spend.index)
+
+    fixed = spend.loc[fixed_mask, "value"].sum()
+    essentials = spend.loc[necessity_series == "Essentials", "value"].sum()
     total = spend["value"].sum()
     variable = total - fixed
     discretionary = total - essentials
@@ -189,6 +222,31 @@ def _spend_split(df: pd.DataFrame) -> SpendSplit:
         "essentials": float(essentials),
         "discretionary": float(max(discretionary, 0.0)),
     }
+
+
+def _category_merchants(df: pd.DataFrame, limit: int = 8) -> dict[str, list[BreakdownEntry]]:
+    spend = df.loc[df["amount"] < 0].copy()
+    if spend.empty:
+        return {}
+
+    spend["value"] = spend["amount"].abs()
+
+    results: dict[str, list[BreakdownEntry]] = {}
+    for category, bucket in spend.groupby("category"):
+        totals = (
+            bucket.groupby("merchant_name")["value"].sum().sort_values(ascending=False).head(limit)
+        )
+        overall = bucket["value"].sum()
+        results[str(category)] = [
+            {
+                "name": str(merchant),
+                "amount": float(value),
+                "share": float(value / overall) if overall else 0.0,
+            }
+            for merchant, value in totals.items()
+        ]
+
+    return results
 
 
 def _monthly_bounds(reference: pd.Timestamp) -> tuple[pd.Timestamp, pd.Timestamp]:
@@ -250,6 +308,63 @@ def _cash_projection(df: pd.DataFrame, reference: pd.Timestamp) -> CashProjectio
         "daily_burn_rate": float(daily_burn_rate),
         "days_remaining": int(days_remaining),
     }
+
+
+def _month_to_date_projection(
+    df: pd.DataFrame,
+    reference: pd.Timestamp,
+    daily_burn_rate: float,
+) -> list[MonthToDatePoint]:
+    if df.empty:
+        return []
+
+    month_start, month_end = _monthly_bounds(reference)
+    calendar = pd.date_range(month_start, month_end, freq="D")
+    month_df = df.loc[
+        (df["posted_date"] >= month_start) & (df["posted_date"] <= month_end)
+    ].copy()
+
+    if month_df.empty:
+        return [
+            {
+                "date": day.strftime("%Y-%m-%d"),
+                "actual": None,
+                "projected": 0.0,
+            }
+            for day in calendar
+        ]
+
+    daily_spend = (
+        month_df.loc[month_df["amount"] < 0]
+        .groupby(month_df["posted_date"].dt.date)["amount"]
+        .sum()
+        .abs()
+    )
+    cumulative = daily_spend.reindex(calendar.date, fill_value=0).cumsum()
+
+    reference_day = reference.date()
+    actual_reference = float(cumulative.loc[reference_day]) if reference_day in cumulative.index else 0.0
+
+    points: list[MonthToDatePoint] = []
+    for day in calendar:
+        actual_value: float | None
+        if day.date() <= reference_day:
+            actual_value = float(cumulative.loc[day.date()])
+            projected_value = actual_value
+        else:
+            actual_value = None
+            days_ahead = (day.date() - reference_day).days
+            projected_value = float(actual_reference + daily_burn_rate * days_ahead)
+
+        points.append(
+            {
+                "date": day.strftime("%Y-%m-%d"),
+                "actual": actual_value,
+                "projected": projected_value,
+            }
+        )
+
+    return points
 
 
 def _next_payday(reference: date) -> date:
@@ -331,15 +446,10 @@ def _recurring_insights(df: pd.DataFrame, reference: pd.Timestamp) -> list[Recur
 
 
 def _anomaly_insights(df: pd.DataFrame) -> list[AnomalyInsight]:
-    spend = df.loc[df["amount"] < 0].copy()
+    spend = _spend_with_zscores(df)
     if spend.empty:
         return []
 
-    stats = spend.groupby("merchant_name")["abs_amount"].agg(["mean", "std"])
-    spend = spend.join(stats, on="merchant_name", rsuffix="_merchant")
-    spend["std"] = spend["std"].replace(0, np.nan)
-    spend["z_score"] = (spend["abs_amount"] - spend["mean"]) / spend["std"]
-    spend.loc[~np.isfinite(spend["z_score"]), "z_score"] = np.nan
     anomalies = spend.loc[spend["z_score"].abs() >= 2.5].copy()
     if anomalies.empty:
         return []
@@ -356,6 +466,43 @@ def _anomaly_insights(df: pd.DataFrame) -> list[AnomalyInsight]:
         }
         for _, row in anomalies.head(20).iterrows()
     ]
+
+
+def _spend_with_zscores(df: pd.DataFrame) -> pd.DataFrame:
+    spend = df.loc[df["amount"] < 0].copy()
+    if spend.empty:
+        return spend
+
+    stats = spend.groupby("merchant_name")["abs_amount"].agg(["mean", "std"])
+    spend = spend.join(stats, on="merchant_name", rsuffix="_merchant")
+    spend["std"] = spend["std"].replace(0, np.nan)
+    spend["z_score"] = (spend["abs_amount"] - spend["mean"]) / spend["std"]
+    spend.loc[~np.isfinite(spend["z_score"]), "z_score"] = np.nan
+    return spend
+
+
+def _outlier_points(df: pd.DataFrame, threshold: float = 2.5) -> list[OutlierPoint]:
+    spend = _spend_with_zscores(df)
+    if spend.empty:
+        return []
+
+    points: list[OutlierPoint] = []
+    for _, row in spend.iterrows():
+        z_score = row.get("z_score")
+        is_flagged = bool(pd.notna(z_score) and abs(float(z_score)) >= threshold)
+        points.append(
+            {
+                "txn_id": str(row.get("transaction_id") or row.get("id", "")),
+                "posted_date": pd.to_datetime(row["posted_date"]).strftime("%Y-%m-%d"),
+                "merchant": str(row.get("merchant_name", "Unknown")),
+                "category": str(row.get("category", "")),
+                "amount": float(row["abs_amount"]),
+                "z_score": float(z_score) if pd.notna(z_score) else None,
+                "is_flagged": is_flagged,
+            }
+        )
+
+    return points
 
 
 def _category_spend(df: pd.DataFrame) -> list[BreakdownEntry]:
@@ -392,6 +539,7 @@ def calculate_kpis(transactions: pd.DataFrame) -> InsightsPayload:
             "monthly_balance": [],
             "top_categories": {},
             "top_merchants": {},
+            "category_merchants": {},
             "spend_split": {"fixed": 0.0, "variable": 0.0, "essentials": 0.0, "discretionary": 0.0},
             "cash_projection": {
                 "as_of": datetime.utcnow().strftime("%Y-%m-%d"),
@@ -404,6 +552,8 @@ def calculate_kpis(transactions: pd.DataFrame) -> InsightsPayload:
             "recurring": [],
             "anomalies": [],
             "category_spend": [],
+            "month_to_date_projection": [],
+            "outlier_points": [],
         }
 
     reference_date = df["posted_date"].max().normalize()
@@ -446,17 +596,30 @@ def calculate_kpis(transactions: pd.DataFrame) -> InsightsPayload:
         for name, months in windows.items()
     }
 
+    monthly_balance = _monthly_balance(df)
+    category_spend = _category_spend(df)
+    category_merchants = _category_merchants(df)
+    cash_projection = _cash_projection(df, reference_date)
+    month_to_date_projection = _month_to_date_projection(
+        df, reference_date, cash_projection["daily_burn_rate"]
+    )
+    anomalies = _anomaly_insights(df)
+    outlier_points = _outlier_points(df)
+
     payload: InsightsPayload = {
         "summary": summary,
-        "monthly_balance": _monthly_balance(df),
+        "monthly_balance": monthly_balance,
         "top_categories": top_categories,
         "top_merchants": top_merchants,
+        "category_merchants": category_merchants,
         "spend_split": _spend_split(df),
-        "cash_projection": _cash_projection(df, reference_date),
+        "cash_projection": cash_projection,
         "payday": _payday_stats(reference_date),
         "recurring": _recurring_insights(df, reference_date),
-        "anomalies": _anomaly_insights(df),
-        "category_spend": _category_spend(df),
+        "anomalies": anomalies,
+        "category_spend": category_spend,
+        "month_to_date_projection": month_to_date_projection,
+        "outlier_points": outlier_points,
     }
 
     return payload
