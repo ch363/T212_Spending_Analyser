@@ -11,19 +11,20 @@ from . import utils
 def plot_spending_over_time(transactions: pd.DataFrame):
     """Return a Plotly figure visualising spending over time."""
 
-    df = utils.ensure_dataframe(transactions)
+    df = utils.ensure_dataframe(transactions).copy()
 
     if "month" not in df:
-        df = df.assign(
-            month=pd.to_datetime(df["date"]).dt.to_period("M").dt.to_timestamp()
-        )
+        df["month"] = pd.to_datetime(df["posted_date"]).dt.to_period("M").dt.to_timestamp()
 
-    grouped = (
-        df.groupby("month", as_index=False)["amount"].sum().assign(amount=lambda d: d["amount"].abs())
+    debit_totals = (
+        df.loc[df["amount"] < 0]
+        .groupby("month", as_index=False)["amount"]
+        .sum()
     )
+    debit_totals["amount"] = debit_totals["amount"].abs()
 
     fig = px.bar(
-        grouped,
+        debit_totals,
         x="month",
         y="amount",
         title="Monthly spend",
