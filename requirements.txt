@@ -4,4 +4,4 @@ plotly>=5.23
 altair>=5.0
 streamlit>=1.38
 scikit-learn>=1.4
-openai>=1.43
+openai>=1.40.0
