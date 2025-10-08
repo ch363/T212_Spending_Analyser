@@ -20,10 +20,19 @@ try:  # pragma: no cover - optional dependency in non-Streamlit contexts
 except Exception:  # pragma: no cover
     st = None  # type: ignore[assignment]
 
+# Attempt to support both OpenAI SDK v1 (preferred) and legacy 0.x
+_OPENAI_SDK: str | None = None
 try:  # pragma: no cover - optional dependency
-    from openai import OpenAI
-except ImportError:  # pragma: no cover - optional dependency
-    OpenAI = None  # type: ignore[assignment]
+    from openai import OpenAI  # type: ignore
+    _OPENAI_SDK = "v1"
+except Exception:  # pragma: no cover - optional dependency
+    try:
+        import openai as _openai_legacy  # type: ignore
+        OpenAI = None  # type: ignore[assignment]
+        _OPENAI_SDK = "legacy"
+    except Exception:
+        OpenAI = None  # type: ignore[assignment]
+        _OPENAI_SDK = None
 
 
 def _build_prompt_from_snapshot(snapshot: Dict[str, Any]) -> str:
@@ -143,10 +152,11 @@ def _fallback_summary(df: pd.DataFrame) -> str:
 
 
 def summarize_spending(transactions: pd.DataFrame, *, model: str = os.getenv("LLM_MODEL", "gpt-4o-mini")) -> str:
-    """Summarise spending patterns using an LLM only (no deterministic fallback).
+    """Summarise spending patterns using an LLM.
 
-    If OpenAI is not installed or OPENAI_API_KEY is not set, we return a clear
-    instructional message to enable AI.
+    - Supports OpenAI SDK v1 (preferred) and legacy 0.x fallback.
+    - Reads OPENAI_API_KEY from Streamlit secrets first, then environment.
+    - On any failure, returns a concise deterministic fallback with diagnostics (Streamlit expander).
     """
 
     df = utils.ensure_dataframe(transactions)
@@ -167,8 +177,6 @@ def summarize_spending(transactions: pd.DataFrame, *, model: str = os.getenv("LL
     if "abs_amount" not in df:
         df["abs_amount"] = df["amount"].abs()
 
-    if OpenAI is None:
-        return _fallback_summary(df)
     # Prefer secrets.toml via Streamlit when available, else fall back to env var
     api_key = None
     if st is not None:
@@ -178,8 +186,40 @@ def summarize_spending(transactions: pd.DataFrame, *, model: str = os.getenv("LL
             api_key = None
     if not api_key:
         api_key = os.getenv("OPENAI_API_KEY")
-    if not api_key:
+
+    # Helper to surface source/reason to the UI
+    def _set_meta(source: str, *, reason: str | None = None, model_name: str | None = None) -> None:
+        if st is None:
+            return
+        try:
+            st.session_state["ai_summary_meta"] = {
+                "source": source,
+                "reason": reason,
+                "model": model_name,
+            }
+        except Exception:
+            pass
+
+    def _fallback_with_diagnostics(reason: str) -> str:
+        if st is not None:
+            try:
+                with st.expander("LLM diagnostics", expanded=False):
+                    st.write({
+                        "sdk": _OPENAI_SDK,
+                        "has_api_key": bool(api_key),
+                        "model": model,
+                        "reason": reason,
+                    })
+            except Exception:
+                pass
+        _set_meta("fallback", reason=reason, model_name=model)
         return _fallback_summary(df)
+
+    # Guard conditions
+    if _OPENAI_SDK is None:
+        return _fallback_with_diagnostics("openai package not installed (need openai>=1.0 or legacy 0.x)")
+    if not api_key:
+        return _fallback_with_diagnostics("OPENAI_API_KEY not found in Streamlit secrets or environment")
 
     # Build compact snapshot from KPIs
     payload = insights.calculate_kpis(df)
@@ -187,43 +227,52 @@ def summarize_spending(transactions: pd.DataFrame, *, model: str = os.getenv("LL
     snapshot = _build_snapshot(payload, period_date)
     prompt = _build_prompt_from_snapshot(snapshot)
 
-    try:
-        # Prefer the newer Responses API when available
-        client = OpenAI(api_key=api_key) if api_key else OpenAI()
-        text: str | None = None
-        try:
-            resp: Any = client.responses.create(
-                model=model,
-                input=prompt,
-            )
-            # Newer SDKs expose an aggregated output_text
-            text = getattr(resp, "output_text", None)
-            if not text:
-                # Fallback attempt to extract from content parts structure
-                content = getattr(resp, "output", None) or getattr(resp, "choices", None)
-                if content:
-                    # Best-effort parsing across SDK variants
-                    if hasattr(content, "data"):
-                        parts = content.data
-                    else:
-                        parts = content
-                    # Extract first textual segment we find
-                    try:
-                        if isinstance(parts, list) and parts:
-                            maybe = parts[0]
-                            if hasattr(maybe, "content") and isinstance(maybe.content, list) and maybe.content:
-                                # type: ignore[attr-defined]
-                                text = getattr(maybe.content[0], "text", None) or getattr(maybe.content[0], "value", None)
-                    except Exception:
-                        pass
-        except Exception:
-            # Back-compat using Chat Completions API
-            resp_cc: Any = client.chat.completions.create(
-                model=model,
-                messages=[{"role": "user", "content": prompt}],
-            )
-            text = (resp_cc.choices[0].message.content or "").strip()
+    # Execute via SDK v1 or legacy 0.x, with light caching if Streamlit available
+    def _call_v1() -> str:
+        assert _OPENAI_SDK == "v1"
+        client = OpenAI(api_key=api_key)  # type: ignore[name-defined]
+        resp = client.chat.completions.create(
+            model=model,
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0.2,
+            max_tokens=320,
+        )
+        return (resp.choices[0].message.content or "").strip()
 
-        return (text or "").strip() or _fallback_summary(df)
-    except Exception:
-        return _fallback_summary(df)
+    def _call_legacy() -> str:
+        assert _OPENAI_SDK == "legacy"
+        _openai_legacy.api_key = api_key  # type: ignore[name-defined]
+        resp = _openai_legacy.ChatCompletion.create(  # type: ignore[name-defined]
+            model=model,
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0.2,
+            max_tokens=320,
+        )
+        return resp["choices"][0]["message"]["content"].strip()
+
+    try:
+        if st is not None:
+            @st.cache_data(show_spinner=False, ttl=300)
+            def _cached(kind: str, p: str, m: str) -> str:
+                # Re-read the key inside the cache to avoid including it in cache key
+                key = None
+                try:
+                    key = st.secrets.get("OPENAI_API_KEY")  # type: ignore[assignment]
+                except Exception:
+                    key = os.getenv("OPENAI_API_KEY")
+                if not key:
+                    raise RuntimeError("Missing OPENAI_API_KEY in cached call")
+                if kind == "v1":
+                    return _call_v1()
+                else:
+                    return _call_legacy()
+
+            text = _cached(_OPENAI_SDK, prompt, model)
+        else:
+            text = _call_v1() if _OPENAI_SDK == "v1" else _call_legacy()
+        if text:
+            _set_meta("ai", reason=None, model_name=model)
+            return text
+        return _fallback_with_diagnostics("Empty LLM response")
+    except Exception as e:
+        return _fallback_with_diagnostics(f"LLM call failed: {type(e).__name__}: {e}")
