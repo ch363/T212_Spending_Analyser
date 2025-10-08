@@ -400,7 +400,6 @@ def main() -> None:
         filtered = filtered.loc[filtered["currency"] == currency_choice].copy()
 
     insight_payload = insights.calculate_kpis(filtered)
-    summary = summarize.summarize_spending(filtered)
 
     monthly_balance_df = pd.DataFrame(insight_payload["monthly_balance"])
     if not monthly_balance_df.empty:
@@ -621,12 +620,37 @@ def main() -> None:
             category_row_right.caption("No category spend available for the selected period.")
 
     with st.container():
-        st.markdown("### Narrative summary")
-        st.caption("LLM-ready copy spanning the full-width canvas")
-        if summary:
-            st.markdown(summary)
+        # Auto-generate on page load/refresh
+        if filtered.empty:
+            st.markdown("### Narrative summary")
+            st.caption("LLM-ready copy spanning the full-width canvas")
+            st.caption("No data in the current filter to summarise.")
         else:
-            st.caption("Summary will appear once data is available.")
+            with st.spinner("Generating AI summary…"):
+                ai_summary = summarize.summarize_spending(filtered)
+
+            # Determine source and render a small badge next to the title
+            is_fallback = isinstance(ai_summary, str) and ai_summary.startswith("Highlights —")
+            badge_label = "[Fallback]" if is_fallback else "[AI]"
+            badge_class = "fallback-badge" if is_fallback else "ai-badge"
+
+            st.markdown(
+                """
+                <style>
+                .title-row { display: flex; align-items: center; gap: 8px; margin-bottom: 0.1rem; }
+                .ai-badge { font-size: 0.75rem; font-weight: 700; color: #155e75; background: #cffafe; border: 1px solid #06b6d4; border-radius: 999px; padding: 2px 8px; }
+                .fallback-badge { font-size: 0.75rem; font-weight: 700; color: #6b7280; background: #f3f4f6; border: 1px solid #d1d5db; border-radius: 999px; padding: 2px 8px; }
+                </style>
+                """,
+                unsafe_allow_html=True,
+            )
+
+            st.markdown(
+                f'<div class="title-row"><h3>Narrative summary</h3><span class="{badge_class}">{badge_label}</span></div>',
+                unsafe_allow_html=True,
+            )
+            st.caption("LLM-ready copy spanning the full-width canvas")
+            st.markdown(ai_summary)
 
     projection = insight_payload["cash_projection"]
     payday = insight_payload["payday"]

@@ -171,7 +171,8 @@ def _monthly_balance(df: pd.DataFrame) -> list[MonthlyBalance]:
         if isinstance(month, pd.Period):
             month_ts = month.to_timestamp()
         else:
-            month_ts = pd.to_datetime(month)
+            # Ensure robust conversion for arbitrary group keys
+            month_ts = pd.to_datetime(str(month))
         credits = bucket.loc[bucket["amount"] > 0, "amount"].sum()
         debits = -bucket.loc[bucket["amount"] < 0, "amount"].sum()
         records.append(
