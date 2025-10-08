@@ -231,13 +231,39 @@ def summarize_spending(transactions: pd.DataFrame, *, model: str = os.getenv("LL
     def _call_v1() -> str:
         assert _OPENAI_SDK == "v1"
         client = OpenAI(api_key=api_key)  # type: ignore[name-defined]
-        resp = client.chat.completions.create(
+        try:
+            resp = client.responses.create(
+                model=model,
+                input=prompt,
+                temperature=0.2,
+                max_output_tokens=320,
+            )
+            text = getattr(resp, "output_text", None)
+            if not text:
+                content = getattr(resp, "output", None) or getattr(resp, "choices", None)
+                if content:
+                    parts = content.data if hasattr(content, "data") else content
+                    if isinstance(parts, list) and parts:
+                        first = parts[0]
+                        if hasattr(first, "text"):
+                            text = getattr(first, "text", None)
+                        elif hasattr(first, "content"):
+                            segment = first.content
+                            if isinstance(segment, list) and segment:
+                                text = getattr(segment[0], "text", None) or getattr(segment[0], "value", None)
+            if text:
+                return text.strip()
+        except Exception:
+            pass
+
+        # Fallback to chat completions (broader model availability)
+        resp_cc = client.chat.completions.create(
             model=model,
             messages=[{"role": "user", "content": prompt}],
             temperature=0.2,
             max_tokens=320,
         )
-        return (resp.choices[0].message.content or "").strip()
+        return (resp_cc.choices[0].message.content or "").strip()
 
     def _call_legacy() -> str:
         assert _OPENAI_SDK == "legacy"
